@@ -271,6 +271,16 @@ impl Drop for LabDropGuard {
 
 impl LabInner {
     /// Returns a cloned tokio runtime handle for the given namespace.
+    /// Removes a device, see [`Lab::remove_device`].
+    pub(crate) fn remove_device(&self, id: NodeId) -> Result<()> {
+        let dev = self.core.lock().unwrap().remove_device(id)?;
+        self.netns.remove_worker(&dev.ns);
+        self.emit(LabEventKind::DeviceRemoved {
+            name: dev.name.to_string(),
+        });
+        Ok(())
+    }
+
     pub(crate) fn rt_handle_for(&self, ns: &str) -> Result<tokio::runtime::Handle> {
         self.netns.rt_handle_for(ns)
     }
@@ -1108,12 +1118,7 @@ impl Lab {
     ///
     /// The kernel automatically destroys veth pairs when the namespace closes.
     pub fn remove_device(&self, id: NodeId) -> Result<()> {
-        let dev = self.inner.core.lock().unwrap().remove_device(id)?;
-        self.inner.netns.remove_worker(&dev.ns);
-        self.inner.emit(LabEventKind::DeviceRemoved {
-            name: dev.name.to_string(),
-        });
-        Ok(())
+        self.inner.remove_device(id)
     }
 
     /// Removes a router from the lab, destroying its namespace and all interfaces.

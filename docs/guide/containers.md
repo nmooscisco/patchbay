@@ -43,8 +43,8 @@ The builder mirrors the device builder for wiring (`uplink`, `iface`,
 | `volume_ro(host, container)` | Bind-mount a host path read-only. |
 | `tmpfs(container)` | Mount a fresh tmpfs at a path. |
 | `run_arg(a)` | Pass an extra flag to `podman run` (escape hatch). |
-| `ready_tcp(port)` | Block `build` until `port` accepts a connection. |
-| `runtime(name)` | Override the runtime binary (default `podman`). |
+| `ready_tcp(port)` | Block `build` until `port` accepts a connection (30 s timeout). |
+| `ready_tcp_timeout(port, timeout)` | Like `ready_tcp` with an explicit timeout. |
 
 ## Volumes and config
 
@@ -62,8 +62,9 @@ let pebble = lab
     .await?;
 ```
 
-On SELinux hosts a bind mount may need a `:z`/`:Z` label; add it with
-`run_arg`, e.g. `run_arg("--security-opt=label=disable")`.
+On SELinux hosts a bind mount may need relabeling or no label. The builder
+cannot add a `:z` suffix to a volume, but you can turn labeling off with
+`run_arg("--security-opt=label=disable")`.
 
 The returned [`Container`] dereferences to [`Device`], so `ip()`, `run_sync()`,
 and the other device accessors work directly. It also has:
@@ -80,7 +81,10 @@ and the other device accessors work directly. It also has:
 If a process dies without cleanup (for example on `SIGKILL` or Ctrl-C), its
 containers keep running. The next patchbay process that starts a container
 removes them. Each container has a `patchbay.owner` label with the pid and
-start time of the process that started it.
+start time of the process that started it. podman in your shell lists these
+containers and can remove stopped ones, but cannot `exec` into them, copy
+files, or stop one that runs as a user other than root, because they run in
+patchbay's user namespace. `kill` on the container's process works.
 
 ## Differences from a device
 
@@ -91,6 +95,11 @@ start time of the process that started it.
   namespaces, so a container cannot change routes or firewall rules. patchbay
   sets per-namespace sysctls so that it can still bind ports below 1024 and
   ping.
+- `run_sync`, `spawn` and the other device methods run code in the device's
+  network namespace on the host file system, not in the container. Use
+  `exec` to run a command in the container.
+- `Lab::remove_device` does not stop the container. Drop the handle or call
+  `stop()`.
 
 ## Runtime: podman, not docker
 

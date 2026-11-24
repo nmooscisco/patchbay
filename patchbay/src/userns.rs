@@ -25,6 +25,45 @@ const AMBIENT_CAPS: [u32; 3] = [
 /// Why root is not mapped, set by the bootstrap when it maps only the user.
 static NO_ROOT_REASON: OnceLock<String> = OnceLock::new();
 
+/// Request and reply pipe of the host helper, see [`host_kill`].
+static HOST_HELPER: OnceLock<std::sync::Mutex<HostHelper>> = OnceLock::new();
+
+/// The parent's ends of the pipes to the host helper process.
+struct HostHelper {
+    requests: std::os::fd::OwnedFd,
+    replies: std::os::fd::OwnedFd,
+}
+
+/// Sends `signal` to the process `pid` (a pid of the host pid namespace) from
+/// the initial user namespace.
+///
+/// The bootstrap keeps the child that ran `newuidmap` alive in the initial
+/// user namespace. As the user who owns every namespace patchbay creates, it
+/// may signal processes there that patchbay's own process may not, such as a
+/// container process running as a subordinate id, also one that another,
+/// dead patchbay process started. The helper exits when this process does.
+///
+/// Fails if the bootstrap mapped no subordinate range, so no helper exists.
+pub(crate) fn host_kill(pid: u32, signal: i32) -> anyhow::Result<()> {
+    use rustix::io::{read, write};
+    let helper = HOST_HELPER
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("no host helper: patchbay mapped no subordinate ids"))?;
+    let helper = helper.lock().expect("poisoned");
+    let mut request = [0u8; 8];
+    request[..4].copy_from_slice(&pid.to_ne_bytes());
+    request[4..].copy_from_slice(&signal.to_ne_bytes());
+    let sent = write(&helper.requests, &request)?;
+    anyhow::ensure!(sent == request.len(), "short write to host helper");
+    let mut reply = [0u8; 4];
+    let got = read(&helper.replies, &mut reply)?;
+    anyhow::ensure!(got == reply.len(), "host helper exited");
+    match i32::from_ne_bytes(reply) {
+        0 => Ok(()),
+        errno => Err(std::io::Error::from_raw_os_error(errno).into()),
+    }
+}
+
 /// Idempotent user-namespace bootstrap.
 ///
 /// Call at the start of `main()`, or from a `#[ctor::ctor]` function, before
@@ -268,11 +307,18 @@ fn range_bootstrap(uid: u32, gid: u32, range: &RangeParams) -> anyhow::Result<()
             }
             _ => Err(String::new()),
         };
-        let message = match &report {
-            Ok(()) => vec![1],
-            Err(text) => [&[0], text.as_bytes()].concat(),
-        };
+        // Status byte, then the length and text of the helpers' error output.
+        let text = report
+            .as_ref()
+            .err()
+            .map_or(&[][..], |text| text.as_bytes());
+        let mut message = vec![u8::from(report.is_ok())];
+        message.extend_from_slice(&(text.len() as u32).to_ne_bytes());
+        message.extend_from_slice(text);
         let _ = write(&c2p_w, &message);
+        if report.is_ok() {
+            serve_host_helper(&p2c_r, &c2p_w);
+        }
         // SAFETY: exit without running atexit handlers in the forked child.
         unsafe { libc::_exit(0) };
     }
@@ -292,18 +338,23 @@ fn range_bootstrap(uid: u32, gid: u32, range: &RangeParams) -> anyhow::Result<()
     // falls back to the single-id map instead of returning unmapped.
     let pid = getpid().as_raw_nonzero().get() as u32;
     let sent = write(&p2c_w, &pid.to_ne_bytes());
-    let mut message = Vec::new();
-    if sent.is_ok() {
-        let mut buf = [0u8; 512];
-        while let Ok(n @ 1..) = read(&c2p_r, &mut buf) {
-            message.extend_from_slice(&buf[..n]);
-        }
+    let mut header = [0u8; 5];
+    let mut detail = Vec::new();
+    if sent.is_ok() && read_exact(&c2p_r, &mut header).is_ok() {
+        let len = u32::from_ne_bytes(header[1..].try_into().expect("four bytes"));
+        detail.resize(len.min(64 * 1024) as usize, 0);
+        let _ = read_exact(&c2p_r, &mut detail);
     }
-    reap(p2c_w);
-    if message.first() == Some(&1) {
+    if header[0] == 1 {
+        // The child stays as the host helper. It exits when `requests` closes.
+        let _ = HOST_HELPER.set(std::sync::Mutex::new(HostHelper {
+            requests: p2c_w,
+            replies: c2p_r,
+        }));
         return Ok(());
     }
-    let detail = String::from_utf8_lossy(message.get(1..).unwrap_or_default());
+    reap(p2c_w);
+    let detail = String::from_utf8_lossy(&detail);
     let reason = match detail.trim() {
         "" => "newuidmap/newgidmap failed".to_string(),
         detail => format!("newuidmap/newgidmap failed: {detail}"),
@@ -311,6 +362,57 @@ fn range_bootstrap(uid: u32, gid: u32, range: &RangeParams) -> anyhow::Result<()
     tracing::warn!("{reason}; falling back to a single-id user namespace");
     let _ = NO_ROOT_REASON.set(reason);
     write_single_id_maps(uid, gid).context("fall back to single-id maps")
+}
+
+/// Reads exactly `buf.len()` bytes.
+#[cfg(target_os = "linux")]
+fn read_exact(fd: &std::os::fd::OwnedFd, buf: &mut [u8]) -> std::io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match rustix::io::read(fd, &mut buf[filled..]) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => filled += n,
+            Err(rustix::io::Errno::INTR) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Runs the host helper loop in the forked bootstrap child: reads
+/// `(pid, signal)` requests and replies with 0 or the `kill` errno. Returns
+/// when the parent closes its end.
+#[cfg(target_os = "linux")]
+fn serve_host_helper(requests: &std::os::fd::OwnedFd, replies: &std::os::fd::OwnedFd) {
+    use std::os::fd::AsRawFd;
+    // Keep only the two pipe ends, so the helper holds no copy of a file or
+    // socket that the parent opened before the bootstrap.
+    let keep = [requests.as_raw_fd(), replies.as_raw_fd()];
+    let (low, high) = (keep[0].min(keep[1]), keep[0].max(keep[1]));
+    // SAFETY: close_range only closes descriptors this process owns.
+    unsafe {
+        libc::syscall(libc::SYS_close_range, 3, low - 1, 0);
+        libc::syscall(libc::SYS_close_range, low + 1, high - 1, 0);
+        libc::syscall(libc::SYS_close_range, high + 1, u32::MAX, 0);
+    }
+    let mut request = [0u8; 8];
+    while read_exact(requests, &mut request).is_ok() {
+        let pid = u32::from_ne_bytes(request[..4].try_into().expect("four bytes"));
+        let signal = i32::from_ne_bytes(request[4..].try_into().expect("four bytes"));
+        let errno = match i32::try_from(pid) {
+            // SAFETY: kill takes plain integers.
+            Ok(pid) if pid > 0 => match unsafe { libc::kill(pid, signal) } {
+                0 => 0,
+                _ => std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            },
+            _ => libc::EINVAL,
+        };
+        if rustix::io::write(replies, &errno.to_ne_bytes()).is_err() {
+            return;
+        }
+    }
 }
 
 /// Returns the `inner outer count` triples for one id and its subordinate
