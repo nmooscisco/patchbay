@@ -221,6 +221,10 @@ impl ContainerBuilder {
     /// Wires the container device, starts the container, and waits for
     /// readiness.
     ///
+    /// Pulls the image first if it is not present. A pull needs the host
+    /// network, so building a container from inside a lab namespace (for
+    /// example from a device task) only works for images that are present.
+    ///
     /// # Errors
     ///
     /// Returns an error if patchbay's user namespace has no subordinate id
@@ -798,6 +802,16 @@ pub(crate) async fn reap_orphans() {
 async fn ensure_image(image: &str) -> Result<()> {
     if image_present(image).await {
         return Ok(());
+    }
+    // podman runs in the caller's network namespace. A thread that entered a
+    // lab namespace cannot go back to the host's, so it cannot pull.
+    let same_netns = |a: &str, b: &str| matches!((std::fs::read_link(a), std::fs::read_link(b)), (Ok(a), Ok(b)) if a == b);
+    if !same_netns("/proc/thread-self/ns/net", "/proc/self/ns/net") {
+        bail!(
+            "image '{image}' is not present, and it cannot be pulled from inside a lab \
+             namespace (for example from a device task). Build the container from the \
+             host side, or pull the image first"
+        );
     }
     let output = podman(vec!["pull".into(), image.into()]).await?;
     if !output.status.success() {

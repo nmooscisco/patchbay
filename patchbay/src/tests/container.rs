@@ -304,6 +304,10 @@ async fn container_build_from_device_task() -> Result<()> {
         eprintln!("skipping container_build_from_device_task: podman not on PATH");
         return Ok(());
     }
+    // A device task cannot pull, so make sure the image is present.
+    let pull = ["pull", "docker.io/library/alpine:latest"].map(String::from);
+    let output = crate::container::podman(pull.to_vec()).await?;
+    anyhow::ensure!(output.status.success(), "pull failed: {output:?}");
     let lab = Lab::new().await?;
     let net = lab.add_router("net").build().await?;
     let client = lab.add_device("client").uplink(net.id()).build().await?;
@@ -321,4 +325,37 @@ async fn container_build_from_device_task() -> Result<()> {
         })?
         .await??;
     wait_gone(&name).await
+}
+
+/// Building from a device task fails clearly when the image would need a pull.
+#[tokio::test(flavor = "current_thread")]
+#[traced_test]
+async fn container_build_from_device_task_needs_a_present_image() -> Result<()> {
+    check_caps()?;
+    if !podman_available() {
+        eprintln!("skipping: podman not on PATH");
+        return Ok(());
+    }
+    let lab = Lab::new().await?;
+    let net = lab.add_router("net").build().await?;
+    let client = lab.add_device("client").uplink(net.id()).build().await?;
+    let net_id = net.id();
+    let inner_lab = lab.clone();
+    let err = client
+        .spawn(move |_| async move {
+            inner_lab
+                .add_container("box", "localhost/patchbay-test/no-such-image:1")
+                .uplink(net_id)
+                .build()
+                .await
+                .map(drop)
+        })?
+        .await?
+        .expect_err("build should fail");
+    let err = format!("{err:#}");
+    assert!(
+        err.contains("cannot be pulled from inside a lab"),
+        "unexpected: {err}"
+    );
+    Ok(())
 }
